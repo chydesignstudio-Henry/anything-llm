@@ -5,6 +5,9 @@ jest.mock("../../../../../models/telemetry", () => ({
 jest.mock("../../../../../models/systemSettings", () => ({
   SystemSettings: { isMultiUserMode: jest.fn().mockResolvedValue(false) },
 }));
+jest.mock("../../../../../models/workspaceChats", () => ({
+  WorkspaceChats: { count: jest.fn() },
+}));
 
 const {
   websocket,
@@ -125,6 +128,7 @@ describe("websocket plugin handleFeedback", () => {
     await expect(pending).resolves.toEqual({
       feedback: "exit",
       attachments: [],
+      timedOut: true,
     });
   });
 
@@ -217,4 +221,138 @@ describe("websocket plugin session reasoning effort", () => {
     expect(aibitat.updateReasoningEffort).not.toHaveBeenCalled();
     expect(aibitat.continue).not.toHaveBeenCalled();
   });
+});
+
+describe("websocket plugin follow-up chat quota", () => {
+  const { SystemSettings } = require("../../../../../models/systemSettings");
+  const { WorkspaceChats } = require("../../../../../models/workspaceChats");
+  const { User } = require("../../../../../models/user");
+
+  const overLimitUser = { id: 7, role: "default", dailyMessageLimit: 3 };
+
+  /** Runs one interrupt round trip for an invocation owned by user 7. */
+  async function replyWithQuota(feedback = "next") {
+    const { socket, aibitat } = setupPlugin({ userId: 7 });
+    aibitat.continue = jest.fn(async () => {});
+
+    const onInterrupt = aibitat.onInterrupt.mock.calls[0][0];
+    const done = onInterrupt({ from: "USER", to: "@agent" });
+    await flushPromises();
+    await socket.handleFeedback(
+      JSON.stringify({ type: "awaitingFeedback", feedback })
+    );
+    await done;
+    return { socket, aibitat };
+  }
+
+  beforeEach(() => {
+    SystemSettings.isMultiUserMode.mockResolvedValue(true);
+    WorkspaceChats.count.mockResolvedValue(5);
+    jest.spyOn(User, "get").mockResolvedValue(overLimitUser);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    SystemSettings.isMultiUserMode.mockResolvedValue(false);
+  });
+
+  it("refuses the follow-up and ends the session once the 24-hour quota is met", async () => {
+    const { socket, aibitat } = await replyWithQuota();
+
+    expect(aibitat.continue).not.toHaveBeenCalled();
+    const sent = JSON.parse(socket.send.mock.calls.at(-1)[0]);
+    expect(sent.type).toBe("wssFailure");
+    expect(sent.content).toBe(
+      "You have met your maximum 24 hour chat quota of 3 chats. Try again later."
+    );
+    expect(socket.close).toHaveBeenCalled();
+  });
+
+  it("continues the session while the user is under quota", async () => {
+    WorkspaceChats.count.mockResolvedValue(1);
+    const { aibitat } = await replyWithQuota();
+
+    expect(aibitat.continue).toHaveBeenCalledWith("next", []);
+  });
+
+  it("does not enforce the quota in single-user mode", async () => {
+    SystemSettings.isMultiUserMode.mockResolvedValue(false);
+    const { aibitat } = await replyWithQuota();
+
+    expect(User.get).not.toHaveBeenCalled();
+    expect(aibitat.continue).toHaveBeenCalledWith("next", []);
+  });
+});
+
+describe("websocket plugin session exit notice", () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
+
+  /** Starts an interrupt and returns the socket and the settled promise. */
+  async function interrupt() {
+    const { socket, aibitat } = setupPlugin();
+    aibitat.continue = jest.fn(async () => {});
+    const onInterrupt = aibitat.onInterrupt.mock.calls[0][0];
+    const done = onInterrupt({ from: "USER", to: "@agent" });
+    await flushPromises();
+    return { socket, aibitat, done };
+  }
+
+  const sentTypes = (socket) =>
+    socket.send.mock.calls.map(([frame]) => JSON.parse(frame).type);
+
+  it.each(["exit", "/exit", "stop", "/stop", "halt", "/halt"])(
+    "notifies the user before closing on %s",
+    async (command) => {
+      const { socket, done } = await interrupt();
+      await socket.handleFeedback(
+        JSON.stringify({ type: "awaitingFeedback", feedback: command })
+      );
+      await done;
+
+      const notice = socket.send.mock.calls.at(-1)[0];
+      expect(JSON.parse(notice)).toEqual({
+        type: "agentSessionExited",
+        content: command,
+      });
+      expect(socket.send.mock.invocationCallOrder.at(-1)).toBeLessThan(
+        socket.close.mock.invocationCallOrder[0]
+      );
+    }
+  );
+
+  it("sends no notice when the session times out", async () => {
+    const { socket, done } = await interrupt();
+    jest.advanceTimersByTime(SOCKET_TIMEOUT_MS);
+    await done;
+
+    expect(socket.close).toHaveBeenCalled();
+    expect(sentTypes(socket)).not.toContain("agentSessionExited");
+  });
+
+  it("sends no notice for /reset, which clears the chat", async () => {
+    const { socket, done } = await interrupt();
+    await socket.handleFeedback(
+      JSON.stringify({ type: "awaitingFeedback", feedback: "/reset" })
+    );
+    await done;
+
+    expect(socket.close).toHaveBeenCalled();
+    expect(sentTypes(socket)).not.toContain("agentSessionExited");
+  });
+
+  it.each(["/EXIT", " /exit", "exit please", "", null])(
+    "treats %p as a normal reply, not an exit",
+    async (feedback) => {
+      const { socket, aibitat, done } = await interrupt();
+      await socket.handleFeedback(
+        JSON.stringify({ type: "awaitingFeedback", feedback })
+      );
+      await done;
+
+      expect(aibitat.continue).toHaveBeenCalled();
+      expect(socket.close).not.toHaveBeenCalled();
+      expect(sentTypes(socket)).not.toContain("agentSessionExited");
+    }
+  );
 });
